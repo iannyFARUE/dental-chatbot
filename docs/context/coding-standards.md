@@ -71,18 +71,25 @@ Paths are relative to `apps/web` (there is no `src/` folder):
 - Tailwind CSS for all styling
 - Use shadcn/ui components where applicable
 - No inline styles
-- Dark mode first, light mode as option
 
 ## Database
 
 - Supabase (Postgres) is the database. Use the Supabase client; no ORM.
-- Schema changes are numbered SQL migration files (see root `CLAUDE.md` → Database).
+- Schema changes are Supabase CLI migrations in `supabase/migrations/` (see root `CLAUDE.md` → Database).
 - RLS on every table.
 
 ## Data Fetching
 
-- Server components read from Supabase (via `lib/supabase-server.ts`) or call FastAPI (via `lib/api-client.ts`)
-- Client components use Server Actions
+- **Reads:** Server Components read org data directly from Supabase via `lib/supabase-server.ts`
+  (user session, RLS-scoped). Every table read this way needs a `select` RLS policy.
+- **Writes and business logic:** go through FastAPI via `lib/api-client.ts`, called from Server Actions.
+  Don't write to Supabase tables from Next.js, because RLS denies it.
+- **AI/RAG/chat:** always FastAPI.
+- **Client components:** get data as props from a Server Component. Use Server Actions only for
+  mutations, never for fetching. For client-side fetching (polling, streaming chat), use a
+  route handler or call FastAPI from the client (still through `lib/api-client.ts`).
+- User-specific reads depend on cookies, so they're dynamic. Wrap them in `<Suspense>` and never
+  put them in `"use cache"`.
 - Validate all inputs with Zod
 
 ## Error Handling

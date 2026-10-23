@@ -28,6 +28,7 @@ those documents via the Claude API.
   /apps
     /web          Next.js 16 App Router — UI, auth flows, dashboard, embed widget
     /api          FastAPI — RAG pipeline, Claude API calls, document ingestion
+  /supabase       Supabase CLI project: config.toml + migrations/ (created by `supabase init`)
   /docs
     /context      AI workflow, coding standards, current feature tracker
     /specs        Feature specs (one markdown file per slice)
@@ -103,7 +104,7 @@ slice N passes its acceptance criteria.
 
 ### Git
 
-- Branch naming: `slice/01-auth`, `fix/slug-collision`, `chore/update-deps`
+- Branch naming: `feature/01-auth`, `fix/slug-collision`, `chore/update-deps`
 - Commit style: `feat:`, `fix:`, `chore:`, `docs:` prefixes (conventional commits)
 - Never commit `.env` files. They are gitignored.
 - Open a PR for every slice, even as a solo dev. It forces a review pass.
@@ -116,7 +117,15 @@ slice N passes its acceptance criteria.
 
 ### Database
 
-- All schema changes go in `/apps/api/db/migrations/` as numbered SQL files.
+- Schema is managed with the Supabase CLI (`npx supabase …`, run from the repo root).
+  Migrations live in `/supabase/migrations/<timestamp>_<name>.sql`. Not created yet: run
+  `npx supabase init` once, then `npx supabase link --project-ref <ref>`.
+  - New migration: `npx supabase migration new <name>`
+  - Apply locally (needs Docker): `npx supabase start`, then `npx supabase db reset`
+  - Apply to the linked project: `npx supabase db push`
+  - Never edit a migration that has already been pushed; add a new one.
+- Postgres functions (triggers, RLS helpers, pgvector search RPCs) also live in migrations.
+  Put internal ones in the `private` schema so the Data API can't call them.
 - RLS (Row Level Security) is enabled on every table. Default deny. Explicit allow policies only.
 - No raw SQL in application code outside of migrations. Use the Supabase client.
 
@@ -131,10 +140,10 @@ slice N passes its acceptance criteria.
 
 ## Deployment
 
-| App         | Platform           | Trigger               |
-| ----------- | ------------------ | --------------------- |
-| `/apps/web` | Vercel             | Push to `main`        |
-| `/apps/api` | Railway            | Push to `main`        |
-| Database    | Supabase (managed) | Manual migration runs |
+| App         | Platform           | Trigger                         |
+| ----------- | ------------------ | ------------------------------- |
+| `/apps/web` | Vercel             | Push to `main`                  |
+| `/apps/api` | Railway            | Push to `main`                  |
+| Database    | Supabase (managed) | `npx supabase db push` (manual) |
 
 Production URLs are set as environment variables in Vercel and Railway dashboards.

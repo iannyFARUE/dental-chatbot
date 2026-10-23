@@ -41,6 +41,7 @@ Only `next`, `react`, `react-dom` and Tailwind are installed so far. Do **not** 
       /login/page.tsx
       /verify-email/page.tsx
       /accept-invite/page.tsx
+      /confirm/route.ts      ← email verification link (verifyOtp)
     /dashboard               ← all routes here require auth (see proxy.ts)
       layout.tsx             ← shared dashboard shell (sidebar, nav)
       page.tsx               ← dashboard home
@@ -58,8 +59,8 @@ Only `next`, `react`, `react-dom` and Tailwind are installed so far. Do **not** 
     /api                     ← Next.js API routes (server-side only)
       /webhooks
         /stripe/route.ts     ← Stripe webhook handler
-      /auth
-        /callback/route.ts   ← Supabase auth callback
+  /actions
+    auth.ts                  ← signUp, signIn, signOut Server Actions (Supabase Auth)
   /components
     /ui                      ← shadcn/ui primitives (Button, Input, etc.)
     /auth                    ← SignupForm, LoginForm, InviteForm
@@ -89,7 +90,7 @@ Session is stored in cookies via `@supabase/ssr`.
 
 Next.js 16 renamed `middleware.ts` → `proxy.ts` and the exported function
 `middleware` → `proxy`. Proxy runs on the Node.js runtime; don't set a `runtime` export.
-The sample in `docs/specs/01-auth.md` still uses the old names and package.
+The full implementation is in `docs/specs/01-auth.md`.
 
 Runs on every request matching `/dashboard/*` and `/auth/*`. It also refreshes the
 Supabase session cookie (the `@supabase/ssr` pattern).
@@ -136,7 +137,10 @@ export function Topbar() {
 
 ## Calling the FastAPI Backend
 
-All AI/RAG calls go through `lib/api-client.ts`. Never call FastAPI directly
+Rule of thumb (full version in `docs/context/coding-standards.md` → Data Fetching): reads go
+directly to Supabase under RLS; writes, business logic and AI go through FastAPI.
+
+All FastAPI calls go through `lib/api-client.ts`. Never call FastAPI directly
 from components — always go through this wrapper so the base URL and auth
 header are set in one place.
 

@@ -2,7 +2,7 @@
 
 **Slice:** 1 of 6  
 **Status:** Draft  
-**Last updated:** 2026-10-20  
+**Last updated:** 2026-10-22  
 **Depends on:** Nothing (first slice)  
 **Blocked by:** Nothing
 
@@ -29,40 +29,57 @@ assumes an authenticated user with an org context in scope.
 
 ---
 
+## Architecture
+
+Who handles each step:
+
+| Concern                         | Owner                                                   |
+| ------------------------------- | ------------------------------------------------------- |
+| Sign up, log in, log out        | Next.js Server Actions → Supabase Auth (`@supabase/ssr`) |
+| Email verification              | Supabase Auth email → `/auth/confirm` route handler     |
+| Session storage + refresh       | `@supabase/ssr` cookies, refreshed in `proxy.ts`        |
+| Org + profile row creation      | Postgres trigger on `auth.users` (atomic with sign-up)  |
+| Current user + org (`/me`)      | FastAPI                                                 |
+| Invites (create + accept)       | FastAPI (service role) + Resend                         |
+
+Sign-up and login don't go through FastAPI. Calling Supabase from a Server Action
+puts the session straight into cookies, so access and refresh tokens never pass
+through browser JavaScript or a JSON response.
+
+---
+
 ## Data Model
 
-### `organisations` table (Supabase / Postgres)
+All SQL lives in one Supabase CLI migration:
+`npx supabase migration new auth_and_orgs` → `supabase/migrations/<timestamp>_auth_and_orgs.sql`.
+
+### Tables
 
 ```sql
-create table organisations (
+create table public.organisations (
   id          uuid primary key default gen_random_uuid(),
   name        text not null,
-  slug        text not null unique,          -- auto-generated from name
-  plan_tier   text not null default 'free',  -- free | starter | pro | agency
+  slug        text not null unique,
+  plan_tier   text not null default 'free'
+              check (plan_tier in ('free', 'starter', 'pro', 'agency')),
   created_at  timestamptz not null default now()
 );
-```
 
-### `users` table (extends Supabase Auth `auth.users`)
-
-```sql
+-- Profile row for each auth.users row. Created only by the trigger below.
 create table public.users (
   id          uuid primary key references auth.users(id) on delete cascade,
-  org_id      uuid not null references organisations(id),
-  role        text not null default 'member', -- owner | member
+  org_id      uuid not null references public.organisations(id),
+  role        text not null default 'member' check (role in ('owner', 'member')),
   full_name   text,
   created_at  timestamptz not null default now()
 );
-```
 
-### `invites` table
-
-```sql
-create table invites (
+create table public.invites (
   id          uuid primary key default gen_random_uuid(),
-  org_id      uuid not null references organisations(id),
+  org_id      uuid not null references public.organisations(id) on delete cascade,
   email       text not null,
-  token       text not null unique,          -- secure random token
+  token_hash  text not null unique,          -- sha256 of the emailed token; raw token is never stored
+  invited_by  uuid not null references public.users(id),
   accepted    boolean not null default false,
   expires_at  timestamptz not null,
   created_at  timestamptz not null default now()
@@ -71,107 +88,327 @@ create table invites (
 
 ### Indexes
 
+`unique` columns (`organisations.slug`, `invites.token_hash`) are already indexed.
+
 ```sql
-create index on organisations(slug);
-create index on public.users(org_id);
-create index on invites(token);
-create index on invites(email);
+create index on public.users (org_id);
+create index on public.invites (org_id);
+
+-- At most one pending invite per email per org
+create unique index invites_one_pending_per_email
+  on public.invites (org_id, lower(email))
+  where not accepted;
+```
+
+### Helper functions (private schema)
+
+Functions go in a `private` schema so the Supabase Data API can't call them as RPCs.
+
+```sql
+create schema if not exists private;
+grant usage on schema private to authenticated;
+
+-- Caller's org. SECURITY DEFINER so RLS policies can use it
+-- without querying public.users from inside its own policy (infinite recursion).
+create or replace function private.current_org_id()
+returns uuid
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select org_id from public.users where id = (select auth.uid())
+$$;
+
+-- "Bright Smile Dental" → "bright-smile-dental", then "-2", "-3", … on collision.
+create or replace function private.unique_org_slug(p_name text)
+returns text
+language plpgsql
+set search_path = ''
+as $$
+declare
+  base      text := coalesce(nullif(trim(both '-' from regexp_replace(lower(p_name), '[^a-z0-9]+', '-', 'g')), ''), 'clinic');
+  candidate text := base;
+  n         int  := 1;
+begin
+  while exists (select 1 from public.organisations where slug = candidate) loop
+    n := n + 1;
+    candidate := base || '-' || n;
+  end loop;
+  return candidate;
+end;
+$$;
+```
+
+### Sign-up trigger
+
+This creates the org and the profile row in the same transaction as the `auth.users` insert,
+so a failure partway through can't leave a user with no org.
+
+- **Owner sign-up:** reads `full_name` and `org_name` from `raw_user_meta_data`, which the
+  Server Action sets.
+- **Invite acceptance:** reads `invite_id` from `raw_app_meta_data`. Only the service role can
+  set `app_metadata`, so a client can't use it to join another org.
+
+```sql
+create or replace function private.handle_new_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  v_invite_id uuid := (new.raw_app_meta_data ->> 'invite_id')::uuid;
+  v_org_id    uuid;
+  v_role      text;
+begin
+  if v_invite_id is not null then
+    update public.invites
+       set accepted = true
+     where id = v_invite_id
+       and not accepted
+       and expires_at > now()
+       and lower(email) = lower(new.email)
+    returning org_id into v_org_id;
+
+    if v_org_id is null then
+      raise exception 'invalid or expired invite';
+    end if;
+    v_role := 'member';
+  else
+    insert into public.organisations (name, slug)
+    values (
+      new.raw_user_meta_data ->> 'org_name',
+      private.unique_org_slug(new.raw_user_meta_data ->> 'org_name')
+    )
+    returning id into v_org_id;
+    v_role := 'owner';
+  end if;
+
+  insert into public.users (id, org_id, role, full_name)
+  values (new.id, v_org_id, v_role, new.raw_user_meta_data ->> 'full_name');
+
+  return new;
+end;
+$$;
+
+create trigger on_auth_user_created
+  after insert on auth.users
+  for each row execute function private.handle_new_user();
 ```
 
 ### Row-Level Security (RLS)
 
+RLS is enabled on every table, and anything without a policy is denied. Writes to these
+tables go only through the trigger or the FastAPI service role. The service role
+**bypasses RLS**, so FastAPI must still filter by `org_id` itself.
+
 ```sql
--- Users can only read their own org's data
-alter table public.users enable row level security;
+alter table public.organisations enable row level security;
+alter table public.users         enable row level security;
+alter table public.invites       enable row level security;  -- no policies: service role only
 
-create policy "users_own_org" on public.users
-  for all using (
-    auth.uid() = id
-    or org_id = (select org_id from public.users where id = auth.uid())
-  );
+create policy "members read own org"
+  on public.organisations for select
+  to authenticated
+  using (id = (select private.current_org_id()));
 
-alter table organisations enable row level security;
-
-create policy "org_members_only" on organisations
-  for select using (
-    id = (select org_id from public.users where id = auth.uid())
-  );
+create policy "members read users in own org"
+  on public.users for select
+  to authenticated
+  using (org_id = (select private.current_org_id()));
 ```
+
+Wrapping `auth.uid()` and the helper in `(select …)` makes Postgres evaluate them once per
+query instead of once per row.
 
 ---
 
-## API Contracts
+## Next.js (apps/web)
 
-All FastAPI endpoints live under `/api/v1/auth/`.
+### Routes, actions and libs
 
-### `POST /api/v1/auth/signup`
+```
+/app
+  /auth
+    /signup/page.tsx         ← SignupForm (Server Action: signUp)
+    /login/page.tsx          ← LoginForm  (Server Action: signIn)
+    /verify-email/page.tsx   ← "Check your inbox" holding page
+    /confirm/route.ts        ← Verifies the email link (verifyOtp), sets session cookie
+    /accept-invite/page.tsx  ← AcceptInviteForm (token from ?token=)
+  /dashboard
+    layout.tsx               ← Re-checks the user (getUser) and redirects if missing
+    page.tsx                 ← Dashboard home
+/actions/auth.ts             ← signUp, signIn, signOut Server Actions
+/lib/supabase.ts             ← createBrowserClient
+/lib/supabase-server.ts      ← createClient(): createServerClient bound to await cookies()
+/proxy.ts                    ← Session refresh + route protection
+```
 
-**Request**
+### Server Actions (`actions/auth.ts`)
 
-```json
-{
-  "email": "owner@brightsmiledental.com",
-  "password": "SecurePass123!",
-  "full_name": "Jane Smith",
-  "org_name": "Bright Smile Dental"
+All of these validate input with Zod first and return `{ success, data, error }`.
+
+- **`signUp`**: `supabase.auth.signUp({ email, password, options: { data: { full_name, org_name } } })`,
+  then redirect to `/auth/verify-email`. When email confirmation is on, Supabase returns the
+  same response whether or not the email already exists, to prevent account enumeration.
+  Always show "check your inbox".
+- **`signIn`**: `supabase.auth.signInWithPassword(...)`. If the error code is
+  `email_not_confirmed`, show "Please verify your email first". On success, redirect to `/dashboard`.
+- **`signOut`**: `supabase.auth.signOut()`, then redirect to `/auth/login`.
+
+### Server client (`lib/supabase-server.ts`)
+
+```typescript
+import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
+
+export async function createClient() {
+  const cookieStore = await cookies();
+
+  return createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return cookieStore.getAll();
+        },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options),
+            );
+          } catch {
+            // Called from a Server Component, which can't set cookies; proxy.ts refreshes the session.
+          }
+        },
+      },
+    },
+  );
 }
 ```
 
-**Success `201`**
+### Route protection (`proxy.ts`)
 
-```json
-{
-  "user_id": "uuid",
-  "org_id": "uuid",
-  "org_slug": "bright-smile-dental",
-  "message": "Verification email sent"
+Next.js 16 renamed `middleware.ts` → `proxy.ts`. Proxy runs on the Node.js runtime.
+
+```typescript
+import { createServerClient } from "@supabase/ssr";
+import { NextResponse, type NextRequest } from "next/server";
+
+export async function proxy(request: NextRequest) {
+  let response = NextResponse.next({ request });
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+          response = NextResponse.next({ request });
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options),
+          );
+        },
+      },
+    },
+  );
+
+  // Verifies the token with Supabase and refreshes the cookie if needed.
+  // Don't use getSession() here: it doesn't verify the token.
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  // Carry any refreshed session cookies over to redirect responses.
+  const redirectTo = (path: string) => {
+    const redirect = NextResponse.redirect(new URL(path, request.url));
+    response.cookies.getAll().forEach((cookie) => redirect.cookies.set(cookie));
+    return redirect;
+  };
+
+  const { pathname } = request.nextUrl;
+
+  if (pathname.startsWith("/dashboard") && !user) {
+    return redirectTo("/auth/login");
+  }
+
+  if (user && (pathname === "/auth/login" || pathname === "/auth/signup")) {
+    return redirectTo("/dashboard");
+  }
+
+  return response;
+}
+
+export const config = {
+  matcher: ["/dashboard/:path*", "/auth/:path*"],
+};
+```
+
+Proxy is a first line of defence only. `dashboard/layout.tsx` calls `getUser()` again and
+redirects if there's no user. Every Server Action and FastAPI endpoint does its own auth check.
+
+### Email confirmation (`app/auth/confirm/route.ts`)
+
+```typescript
+import type { EmailOtpType } from "@supabase/supabase-js";
+import { NextResponse, type NextRequest } from "next/server";
+import { createClient } from "@/lib/supabase-server";
+
+export async function GET(request: NextRequest) {
+  const { searchParams } = request.nextUrl;
+  const tokenHash = searchParams.get("token_hash");
+  const type = searchParams.get("type") as EmailOtpType | null;
+
+  if (tokenHash && type) {
+    const supabase = await createClient();
+    const { error } = await supabase.auth.verifyOtp({ type, token_hash: tokenHash });
+    if (!error) {
+      return NextResponse.redirect(new URL("/dashboard", request.url));
+    }
+  }
+
+  return NextResponse.redirect(new URL("/auth/login?error=verification_failed", request.url));
 }
 ```
 
-**Errors**
-| Code | Reason |
-|------|--------|
-| 400 | Missing required fields |
-| 409 | Email already registered |
-| 422 | Password too weak (min 8 chars, 1 number, 1 uppercase) |
+In the Supabase dashboard, change the **Confirm signup** email template link to
+`{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=email`.
 
-**Side effects**
+### Cache Components
 
-- Creates row in `auth.users` via Supabase Auth
-- Creates row in `organisations`
-- Creates row in `public.users` with `role = 'owner'`
-- Triggers Supabase email verification
+`cacheComponents` is enabled. Anything that reads the session is reading cookies, so it is
+dynamic. Wrap it in `<Suspense>` and never put it in a `"use cache"` scope.
 
 ---
 
-### `POST /api/v1/auth/login`
+## API Contracts (FastAPI)
 
-**Request**
+All endpoints live under `/api/v1/auth/`. Protected endpoints take
+`Authorization: Bearer <access_token>`, the Supabase access token the web app reads from the
+server-side session. They use the shared `get_current_user` / `get_org_id` dependencies
+(see `apps/api/CLAUDE.md`).
 
-```json
-{
-  "email": "owner@brightsmiledental.com",
-  "password": "SecurePass123!"
-}
-```
+### `GET /api/v1/auth/me`
 
 **Success `200`**
 
 ```json
 {
-  "access_token": "jwt...",
-  "refresh_token": "jwt...",
-  "user": {
+  "id": "uuid",
+  "email": "owner@brightsmiledental.com",
+  "full_name": "Jane Smith",
+  "role": "owner",
+  "org": {
     "id": "uuid",
-    "email": "owner@brightsmiledental.com",
-    "full_name": "Jane Smith",
-    "role": "owner",
-    "org": {
-      "id": "uuid",
-      "name": "Bright Smile Dental",
-      "slug": "bright-smile-dental",
-      "plan_tier": "free"
-    }
+    "name": "Bright Smile Dental",
+    "slug": "bright-smile-dental",
+    "plan_tier": "free"
   }
 }
 ```
@@ -179,37 +416,19 @@ All FastAPI endpoints live under `/api/v1/auth/`.
 **Errors**
 | Code | Reason |
 |------|--------|
-| 401 | Invalid credentials |
-| 403 | Email not verified |
+| 401 | Missing, invalid or expired token |
 
 ---
 
-### `GET /api/v1/auth/me`
-
-**Headers:** `Authorization: Bearer <access_token>`
-
-**Success `200`** — same `user` shape as login response
-
-**Errors**
-| Code | Reason |
-|------|--------|
-| 401 | Missing or expired token |
-
----
-
-### `POST /api/v1/auth/invite`
-
-**Headers:** `Authorization: Bearer <access_token>` (owner only)
+### `POST /api/v1/auth/invite` (owner only)
 
 **Request**
 
 ```json
-{
-  "email": "receptionist@brightsmiledental.com"
-}
+{ "email": "receptionist@brightsmiledental.com" }
 ```
 
-**Success `200`**
+**Success `201`**
 
 ```json
 { "message": "Invite sent" }
@@ -218,13 +437,15 @@ All FastAPI endpoints live under `/api/v1/auth/`.
 **Errors**
 | Code | Reason |
 |------|--------|
+| 401 | Missing or invalid token |
 | 403 | Caller is not org owner |
 | 409 | Email already in org or invite pending |
 
-**Side effects**
+**Behaviour**
 
-- Creates row in `invites` with 48h expiry
-- Sends invite email with link: `/auth/accept-invite?token=<token>`
+- Generate the token with `secrets.token_urlsafe(32)` and store only its sha256 in `token_hash`.
+- `expires_at = now() + 48h`
+- Send the raw token by email through Resend, with the link `{WEB_URL}/auth/accept-invite?token=<token>`
 
 ---
 
@@ -234,72 +455,34 @@ All FastAPI endpoints live under `/api/v1/auth/`.
 
 ```json
 {
-  "token": "secure-random-token",
+  "token": "raw-token-from-email",
   "full_name": "Mike Reeves",
   "password": "SecurePass123!"
 }
 ```
 
-**Success `201`** — same shape as signup response
+**Success `201`**
+
+```json
+{ "user_id": "uuid", "org_id": "uuid" }
+```
+
+The web app then calls `signIn` with the same email and password, and the user lands on `/dashboard`.
 
 **Errors**
 | Code | Reason |
 |------|--------|
 | 404 | Token not found |
+| 409 | An account with this email already exists |
 | 410 | Token expired or already accepted |
+| 422 | Password doesn't meet the policy |
 
----
+**Behaviour**
 
-## Next.js Routes & Components
-
-```
-/app
-  /auth
-    /signup
-      page.tsx          ← SignupForm component
-    /login
-      page.tsx          ← LoginForm component
-    /verify-email
-      page.tsx          ← "Check your inbox" holding page
-    /accept-invite
-      page.tsx          ← AcceptInviteForm component
-  /dashboard
-    layout.tsx          ← Protected layout (middleware redirects if no session)
-    page.tsx            ← Dashboard home
-```
-
-### `middleware.ts` (route protection)
-
-```typescript
-import { createMiddlewareClient } from "@supabase/auth-helpers-nextjs";
-import { NextResponse } from "next/server";
-import type { NextRequest } from "next/server";
-
-export async function middleware(req: NextRequest) {
-  const res = NextResponse.next();
-  const supabase = createMiddlewareClient({ req, res });
-  const {
-    data: { session },
-  } = await supabase.auth.getSession();
-
-  const isAuthRoute = req.nextUrl.pathname.startsWith("/auth");
-  const isDashboard = req.nextUrl.pathname.startsWith("/dashboard");
-
-  if (isDashboard && !session) {
-    return NextResponse.redirect(new URL("/auth/login", req.url));
-  }
-
-  if (isAuthRoute && session) {
-    return NextResponse.redirect(new URL("/dashboard", req.url));
-  }
-
-  return res;
-}
-
-export const config = {
-  matcher: ["/dashboard/:path*", "/auth/:path*"],
-};
-```
+1. Hash the token and look up the invite: missing → 404, `accepted` or expired → 410.
+2. Call `supabase.auth.admin.create_user({ "email": invite.email, "password": ..., "email_confirm": True, "user_metadata": {"full_name": ...}, "app_metadata": {"invite_id": invite.id} })`.
+   The click on the emailed link already proves the email address, so it's created as confirmed.
+3. The trigger marks the invite accepted and adds the member row, both in the same transaction.
 
 ---
 
@@ -309,7 +492,7 @@ export const config = {
 
 ```
 NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PUBLIC_SUPABASE_ANON_KEY=
+NEXT_PUBLIC_SUPABASE_ANON_KEY=        # publishable key (sb_publishable_…) or legacy anon key
 NEXT_PUBLIC_API_URL=http://localhost:8000
 ```
 
@@ -317,10 +500,25 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 
 ```
 SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=      # server-side only, never expose to client
-SUPABASE_JWT_SECRET=
+SUPABASE_SERVICE_ROLE_KEY=            # secret key (sb_secret_…) or legacy service_role key; server only
+RESEND_API_KEY=
+WEB_URL=http://localhost:3000
 APP_ENV=development
 ```
+
+No `SUPABASE_JWT_SECRET`. FastAPI validates tokens through Supabase Auth, or locally against the
+project's JWKS once asymmetric signing keys are on. It never uses the shared legacy secret.
+
+---
+
+## Supabase Project Settings
+
+- **Auth → Email:** "Confirm email" on.
+- **Auth → Password policy:** min 8 characters, with lowercase, uppercase and digits required.
+  Zod validates the same rules on the client, but Supabase is the source of truth.
+- **Auth → URL configuration:** Site URL = `WEB_URL`. Add the Vercel production URL to the redirect allow list.
+- **Auth → SMTP:** use custom SMTP (Resend) before launch. The built-in SMTP is heavily
+  rate-limited and only meant for development.
 
 ---
 
@@ -329,23 +527,27 @@ APP_ENV=development
 ### Happy Path
 
 - [ ] User signs up → receives verification email → clicks link → lands on `/dashboard`
-- [ ] User logs in with verified email → lands on `/dashboard` with org context
-- [ ] Unverified user attempts login → receives 403 with clear message
-- [ ] Owner sends invite → invitee receives email → accepts → lands on `/dashboard`
-- [ ] Expired invite token returns 410
+- [ ] Signing up creates exactly one `organisations` row and one `public.users` row with `role = 'owner'`
+- [ ] User logs in with verified email → lands on `/dashboard` with org context from `/api/v1/auth/me`
+- [ ] Unverified user attempts login → sees "Please verify your email first"
+- [ ] Owner sends invite → invitee receives email → accepts → lands on `/dashboard` as `member`
+- [ ] Log out clears the session cookie and redirects to `/auth/login`
 
 ### Security
 
-- [ ] `/dashboard/*` routes redirect to `/auth/login` when no session
-- [ ] `SUPABASE_SERVICE_ROLE_KEY` is never returned in any API response
-- [ ] Passwords are never stored or logged in plaintext (Supabase handles hashing)
-- [ ] RLS policies prevent cross-org data access — tested with two separate orgs
+- [ ] `/dashboard/*` redirects to `/auth/login` when there is no user, both in proxy and in the dashboard layout
+- [ ] No access or refresh token appears in any JSON response, `localStorage` or client JS
+- [ ] `SUPABASE_SERVICE_ROLE_KEY` is never returned in any API response or exposed via `NEXT_PUBLIC_*`
+- [ ] Invite tokens are stored only as hashes
+- [ ] RLS prevents cross-org reads. Test with two orgs using each user's own session (not the service role).
+- [ ] `private.*` functions can't be called through the Supabase Data API
 
 ### Edge Cases
 
-- [ ] Duplicate email on signup returns 409 (not a 500)
-- [ ] Org slug collision (two orgs with same name) — append `-2`, `-3` etc.
-- [ ] Invite to already-registered email returns 409
+- [ ] Signing up with an already-registered email shows the same "check your inbox" screen (no enumeration, no 500)
+- [ ] Org slug collision (two orgs with the same name) → `-2`, `-3` etc.
+- [ ] Inviting an email that is already in the org, or already has a pending invite, returns 409
+- [ ] An expired or already-used invite token returns 410
 
 ---
 
@@ -357,49 +559,34 @@ APP_ENV=development
 - MFA / 2FA
 - Audit logs
 - Org deletion / user removal
+- Editing profile or org name
 
 ---
 
 ## Implementation Notes
 
-1. **Slug generation** — strip non-alphanumeric, lowercase, replace spaces with `-`, check uniqueness, append counter if collision.
-2. **Supabase trigger** — use a Postgres `after insert` trigger on `auth.users` to auto-create the `public.users` row rather than doing it in application code. This avoids partial writes if the API call fails mid-way.
-3. **Token storage** — store the Supabase session in an httpOnly cookie via `@supabase/auth-helpers-nextjs`, not localStorage. Prevents XSS token theft.
-4. **FastAPI auth dependency** — create a reusable `get_current_user` dependency that validates the JWT on every protected endpoint:
-
-```python
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from supabase import create_client
-import os
-
-security = HTTPBearer()
-
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
-    token = credentials.credentials
-    supabase = create_client(
-        os.getenv("SUPABASE_URL"),
-        os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    )
-    try:
-        user = supabase.auth.get_user(token)
-        if not user.user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        return user.user
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-```
-
-5. **Invite emails** — use Supabase's built-in email templates for verification. For invite emails, send via Resend (free tier: 3,000 emails/mo) — add `resend` to FastAPI requirements.
+1. **Migration first.** Write the migration, run `npx supabase db reset` locally (needs Docker)
+   or `npx supabase db push` against the linked project, then build the UI.
+2. **Slug race.** Two simultaneous sign-ups with the same org name can still collide on the
+   `unique` constraint. That sign-up fails with a database error and the user can retry. This is
+   acceptable for v1.
+3. **Trigger errors.** An exception in `handle_new_user` makes Supabase return
+   "Database error saving new user". FastAPI validates invites before calling `create_user`, so
+   in practice this only happens in races.
+4. **FastAPI auth dependency.** Use the shared `get_current_user` in `apps/api/core/dependencies.py`.
+   Don't create a Supabase client inline or read `os.getenv` in routes.
+5. **Emails.** Supabase sends verification emails using its templates. FastAPI sends invite emails
+   through Resend (`resend` package).
 
 ---
 
 ## Definition of Done
 
 - All acceptance criteria checked off
-- FastAPI endpoints tested with Pytest (happy path + key error cases)
+- Migration applies cleanly with `npx supabase db reset`
+- FastAPI endpoints tested with Pytest (happy path + key error cases, Supabase mocked)
+- RLS tested with two orgs using real user sessions
 - Next.js auth flow tested manually end-to-end in dev
+- `npm run build` and `npm run lint` pass
 - Deployed to Vercel + Railway with env vars set
-- No `console.log` of tokens or passwords anywhere in codebase
+- No `console.log` or `print` of tokens or passwords anywhere in the codebase

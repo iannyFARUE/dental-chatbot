@@ -36,7 +36,7 @@ packages, regenerate `requirements.txt` with `pip freeze`.
 /apps/api
   main.py                    ← FastAPI app init, router registration, CORS
   /routers
-    auth.py                  ← /api/v1/auth/*
+    auth.py                  ← /api/v1/auth/* (me, invite, accept-invite; signup/login are in Next.js)
     chatbots.py              ← /api/v1/chatbots/*
     documents.py             ← /api/v1/documents/* (upload + ingest trigger)
     chat.py                  ← /api/v1/chat/* (query endpoint, streaming)
@@ -50,10 +50,8 @@ packages, regenerate `requirements.txt` with `pip freeze`.
   /models
     schemas.py               ← all Pydantic request/response models
   /db
-    supabase_client.py       ← Supabase singleton client
-    migrations/              ← numbered SQL migration files
-      001_initial_schema.sql
-      002_add_invites.sql
+    supabase_client.py       ← get_supabase dependency
+                               (SQL migrations live in /supabase/migrations at the repo root)
   /core
     config.py                ← pydantic-settings config class
     dependencies.py          ← get_current_user, get_org_id, get_db
@@ -211,7 +209,7 @@ See `docs/specs/03-rag-pipeline.md` for full data model and acceptance criteria.
 ## Pydantic Schema Conventions (`models/schemas.py`)
 
 - One file for all schemas. Split only if it exceeds ~300 lines.
-- Request models end in `Request`: `SignupRequest`, `CreateChatbotRequest`
+- Request models end in `Request`: `AcceptInviteRequest`, `CreateChatbotRequest`
 - Response models end in `Response`: `UserResponse`, `ChatbotResponse`
 - Use `model_config = ConfigDict(from_attributes=True)` on all models that
   are built from DB rows.
@@ -261,17 +259,15 @@ from httpx import ASGITransport, AsyncClient
 from main import app
 
 @pytest.mark.asyncio
-async def test_signup_success():
+async def test_accept_invite_unknown_token(mock_supabase):  # fixture: no matching invite
     # httpx 0.28 removed AsyncClient(app=...); use ASGITransport
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        res = await client.post("/api/v1/auth/signup", json={
-            "email": "test@clinic.com",
-            "password": "Password123!",
-            "full_name": "Test Owner",
-            "org_name": "Test Clinic"
+        res = await client.post("/api/v1/auth/accept-invite", json={
+            "token": "does-not-exist",
+            "full_name": "Test Member",
+            "password": "Password123!"
         })
-    assert res.status_code == 201
-    assert "org_slug" in res.json()
+    assert res.status_code == 404
 ```
 
 - Use `pytest-asyncio` for all async tests.
