@@ -1,88 +1,86 @@
-Build a multi-tenant SaaS dashboard for a dental clinic AI chatbot builder.
-The product lets dental clinic owners create and manage AI-powered chatbots
-that answer patient questions on their website.
+Create me a mockup of a dashboard page for a project called ChatClinic
+that lets dental clinic owners build and manage AI-powered chatbots that
+answer patient questions on their website. Clinics upload documents (FAQs,
+policies, service menus) and the chatbot uses those to respond to visitors.
 
-## Tech stack
+## General Feel
 
-Next.js 14 App Router, TypeScript, Tailwind CSS, shadcn/ui components.
-Use shadcn/ui primitives throughout (Card, Button, Badge, Table, Tabs, etc).
-No external chart libraries — use shadcn/ui charts (recharts wrapper) only.
+- Clean, professional, and trustworthy
+- B2B SaaS — designed for non-technical clinic owners, not developers
+- Inspired by Linear, Stripe Dashboard, and Intercom
+- Light mode by default with a calm indigo accent
 
-## Pages to build (use a sidebar layout with these nav items)
+## Layout
 
-### 1. Dashboard Home /dashboard
+- Fixed collapsible sidebar (dark slate-900) with app logo "ChatClinic"
+  top-left, nav icons with labels, and user avatar + org name at the bottom
+- Top bar with page title left, search bar centre, and notification bell
+  - user avatar right
+- Stats bar below top bar: Total Chatbots, Total Conversations this month,
+  Avg Response Time, Documents Uploaded — each as a compact stat card
+- Main content shows a grid of Chatbot Cards (see below)
+- Sidebar nav items: Dashboard, Chatbots, Documents, Analytics, Settings
+- At bottom of sidebar: current plan badge ("Starter · $49/mo") and
+  an Upgrade button
 
-- Stats row at top: Total Chatbots (3), Total Conversations (1,284),
-  Avg Response Time (1.2s), Documents Uploaded (14)
-- Recent conversations table: columns — Chatbot Name, Visitor question
-  (truncated), Response time, Timestamp
-- Quick action cards: "Create New Chatbot", "Upload Documents", "View Analytics"
+## Chatbot Cards
 
-### 2. Chatbots List /dashboard/chatbots
+Each card represents one chatbot the clinic has created. Show 3 cards:
 
-- Page header with "New Chatbot" button (primary)
-- Grid of chatbot cards. Each card shows:
-  - Chatbot name (e.g. "Bright Smile Reception Bot")
-  - Status badge: Active (green) or Draft (grey)
-  - Stat: X conversations this month
-  - Stat: X documents
-  - Actions: "Configure", "Get Embed Code", "View Analytics"
-- Show 3 example chatbot cards with realistic dental clinic names
+- Card 1: "Reception Bot" — Active (green badge) — 423 conversations — 6 docs
+- Card 2: "FAQ Assistant" — Active (green badge) — 218 conversations — 4 docs
+- Card 3: "Appointment Helper" — Draft (grey badge) — 0 conversations — 1 doc
 
-### 3. Chatbot Detail /dashboard/chatbots/[id]
+Each card has: chatbot name, status badge, conversation count, doc count,
+a small sparkline conversation trend (last 7 days), and three action buttons:
+Configure, Embed Code, Analytics
 
-- Tabs: Overview | Documents | Settings | Embed Code
-- Overview tab:
-  - Conversation volume line chart (last 30 days)
-  - Top questions list (5 rows): question text + frequency count
-- Documents tab:
-  - Upload area (drag and drop) with accepted formats: PDF, TXT, DOCX
-  - Table of uploaded docs: Name, Size, Status (Processing/Ready), Uploaded date
-  - Show 3 example rows
-- Settings tab:
-  - Form fields: Chatbot Name, Welcome Message, Primary Color (color picker),
-    Response Language (select: English/Spanish/French)
-  - Save button
-- Embed Code tab:
-  - Code block showing a <script> tag snippet
-  - Copy button
-  - Short instruction text: "Paste this before the closing </body> tag on your website"
+## Stats Cards (above the chatbot grid)
 
-### 4. Settings /dashboard/settings
+- Total Chatbots: 3
+- Conversations this month: 641
+- Avg Response Time: 1.2s
+- Documents uploaded: 14
+  Each stat has a small icon and a subtle percentage change vs last month
 
-- Two sections side by side on desktop, stacked on mobile
-- Left: Organisation Settings — Org name field, plan badge (showing "Starter — $49/mo"),
-  "Upgrade Plan" button
-- Right: Team Members — table of members (Name, Email, Role, Joined date),
-  "Invite Member" button that opens a modal with an email input
+## Recent Activity Feed (right sidebar panel or bottom section)
 
-## Design direction
+A compact feed of recent chatbot interactions:
 
-- Clean, professional, trustworthy — this is a B2B tool for non-technical
-  clinic owners, not a developer tool
-- Sidebar is fixed left, dark (slate-900), with white icons and nav labels
-- Main content area is light grey background (slate-50)
-- Primary accent color: indigo-600
-- Cards use white background with subtle border and shadow
-- Status badges use soft colors (green-100/green-700, slate-100/slate-600)
-- Typography: Inter font, clear hierarchy
-- No decorative illustrations — clean data-focused UI
+- "What are your opening hours?" — Reception Bot — 2 min ago
+- "Do you accept Delta Dental?" — FAQ Assistant — 14 min ago
+- "How do I book an emergency appointment?" — Reception Bot — 1 hr ago
+- "Is teeth whitening covered by insurance?" — FAQ Assistant — 2 hrs ago
 
-## Layout shell
+## General Design Direction
 
-- Fixed sidebar (240px wide) with: app logo top-left ("ChatClinic"),
-  nav items, and user avatar + org name at the bottom
-- Top bar with page title and breadcrumb
-- Responsive: sidebar collapses to hamburger on mobile
+- White card backgrounds with subtle border and soft shadow
+- Slate-50 main content background
+- Indigo-600 as primary accent (buttons, active nav, badges)
+- Inter font, clear typographic hierarchy
+- Status badges use soft colours: green-100/green-700 for Active,
+  slate-100/slate-600 for Draft
+- No decorative illustrations — data-focused, information-dense but not cluttered
 
-## Dummy data
+## Responsive Notes
 
-Use realistic dental clinic names and data throughout:
+- Sidebar collapses to icon-only on medium screens, hamburger drawer on mobile
+- Chatbot cards go from 3-column → 2-column → 1-column as viewport narrows
+- Touch-friendly card actions
+
+## Micro-interactions
+
+- Hover state lifts cards slightly with deeper shadow
+- Active nav item has indigo left border indicator
+- Smooth sidebar collapse transition
+- Toast notification for actions (e.g. "Embed code copied!")
+- Skeleton loading placeholders on stat cards and chatbot grid
+
+## Dummy Data
 
 - Org: "Bright Smile Dental Group"
 - User: "Dr. Sarah Chen"
-- Chatbots: "Reception Bot", "FAQ Assistant", "Appointment Helper"
-- Questions: "What are your opening hours?", "Do you accept Delta Dental insurance?",
-  "How do I book an emergency appointment?"
+- Plan: Starter · $49/mo
 
-Generate all pages as a working prototype with navigation between them.
+This should be a static UI mockup only — not a working app. Focus on
+layout, visual hierarchy, and making it feel polished and production-ready.

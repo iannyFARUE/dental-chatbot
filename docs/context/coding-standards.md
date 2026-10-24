@@ -75,7 +75,7 @@ Paths are relative to `apps/web` (there is no `src/` folder):
 ## Database
 
 - Supabase (Postgres) is the database. Use the Supabase client; no ORM.
-- Schema changes are Supabase CLI migrations in `supabase/migrations/` (see root `CLAUDE.md` → Database).
+- Schema changes are Supabase CLI migrations in `supabase/migrations/` (see `project-overview.md` → Database).
 - RLS on every table.
 
 ## Data Fetching
